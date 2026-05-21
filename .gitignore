@@ -29,3 +29,4 @@ runtime/
 /plugins
 /data
 .claude/settings.local.json
+.venv
