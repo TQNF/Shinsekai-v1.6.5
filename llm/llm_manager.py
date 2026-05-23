@@ -257,6 +257,14 @@ class LLMManager:
     def set_messages(self, new_messages: list):
         """Sets the conversation history to a new list of messages."""
         if isinstance(new_messages, list):
+            if new_messages and new_messages[0].get("role") == "system" and self.user_template:
+                old_content = new_messages[0].get("content", "")
+                if len(old_content) > len(self.user_template) * 2:
+                    self.logger.info(
+                        "替换旧 system prompt: %d chars → %d chars",
+                        len(old_content), len(self.user_template),
+                    )
+                    new_messages[0]["content"] = self.user_template
             self.messages = new_messages
             print("Chat history has been updated.")
         else:
