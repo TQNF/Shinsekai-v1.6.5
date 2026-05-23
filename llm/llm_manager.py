@@ -11,11 +11,25 @@ from openai import OpenAI
 from core.runtime.app_runtime import try_get_app_runtime
 from i18n import tr
 from llm.llm_adapter import LLMAdapter, DeepSeekAdapter, OpenAIAdapter, GeminiAdapter, ClaudeAdapter
-from llm.compact_manager import CompactManager
+from llm.compact_manager import CompactManager, _sanitize_messages
 from llm.tools.tool_manager import ToolManager
 
 tool_manager = ToolManager()
 logger = logging.getLogger(__name__)
+
+
+def _auto_extract_memory_async(user_text: str, assistant_text: str) -> None:
+    """后台线程：自动从对话中提取关键事实存入 mem0。"""
+    if not user_text.strip() or not assistant_text.strip():
+        return
+    try:
+        from llm.tools.memory_tools import _get_mem0, _resolve_agent_id
+        mem = _get_mem0()
+        combined = f"User: {user_text}\nAssistant: {assistant_text}"
+        mem.add(combined, user_id="auto_extract", infer=True)
+        logger.info("自动记忆提取完成")
+    except Exception as e:
+        logger.warning("自动记忆提取失败: %s", e)
 
 
 # 流式输出中非正文的片段（供 LLMWorker 显示思考过程，且不混入 JSON 解析缓冲区）
@@ -208,6 +222,7 @@ class LLMManager:
         # --- Auto-Compact 逻辑 ---
         # 自动调用 compact_manager 检查 token 是否超限并执行压缩
         compacted_messages = self.compact_manager.auto_compact_if_needed(self.messages)
+        compacted_messages = _sanitize_messages(compacted_messages)
         if len(compacted_messages) < len(self.messages):
             self.logger.info(f"Auto-compact triggered: Reduced messages from {len(self.messages)} to {len(compacted_messages)}")
             self.messages = compacted_messages
@@ -221,6 +236,19 @@ class LLMManager:
         if not (content or "").strip() and not extra:
             return
         self.add_message("assistant", content or "", **extra)
+
+        last_user_msg = ""
+        for msg in reversed(self.messages):
+            if msg.get("role") == "user":
+                last_user_msg = msg.get("content", "")
+                break
+        if last_user_msg.strip() and (content or "").strip():
+            t = Thread(
+                target=_auto_extract_memory_async,
+                args=(last_user_msg, content or ""),
+                daemon=True,
+            )
+            t.start()
 
     def get_messages(self):
         """Returns the current list of messages."""

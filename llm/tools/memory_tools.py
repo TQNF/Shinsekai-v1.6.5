@@ -239,3 +239,96 @@ def _tool_memory_remember(
 )
 def _tool_memory_forget(memory_id: str) -> dict[str, Any]:
     return memory_forget(memory_id)
+
+
+# ── Novel RAG ──────────────────────────────────────────────────────
+
+_RAG_QDRANT_PATH = (Path.cwd() / "data" / "memory" / "qdrant_rag").as_posix()
+_RAG_COLLECTION = "novel_rag"
+_RAG_DIMS = 384
+_rag_client: Any = None
+_rag_encoder: Any = None
+_rag_lock = threading.Lock()
+
+
+def _get_rag_client() -> Any:
+    global _rag_client
+    if _rag_client is not None:
+        return _rag_client
+    with _rag_lock:
+        if _rag_client is not None:
+            return _rag_client
+        from qdrant_client import QdrantClient
+        _rag_client = QdrantClient(path=_RAG_QDRANT_PATH)
+        return _rag_client
+
+
+def _get_rag_encoder() -> Any:
+    global _rag_encoder
+    if _rag_encoder is not None:
+        return _rag_encoder
+    with _rag_lock:
+        if _rag_encoder is not None:
+            return _rag_encoder
+        from sentence_transformers import SentenceTransformer
+        _rag_encoder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        return _rag_encoder
+
+
+def novel_search(query: str, limit: int = 5) -> dict[str, Any]:
+    q = (query or "").strip()
+    if not q:
+        return {"error": "query 不能为空"}
+    try:
+        client = _get_rag_client()
+        encoder = _get_rag_encoder()
+        vector = encoder.encode(q).tolist()
+        results = client.query_points(
+            collection_name=_RAG_COLLECTION,
+            query=vector,
+            limit=limit,
+        )
+        hits = []
+        for r in results.points:
+            payload = r.payload or {}
+            hits.append({
+                "score": round(r.score, 4),
+                "chapter": payload.get("chapter", ""),
+                "text": payload.get("text", ""),
+            })
+        return {"query": q, "count": len(hits), "results": hits}
+    except Exception as e:
+        logger.exception("novel_search 失败")
+        return {"error": str(e)}
+
+
+@tool(
+    name="novel_search",
+    description=(
+        "Search the original novel text (RAG). "
+        "Use this when you need to recall plot details, character backgrounds, "
+        "or any information from the novel source material. "
+        "query: keywords or short question about the novel content. "
+        "Returns relevant paragraphs with chapter info."
+    ),
+)
+def _tool_novel_search(query: str, limit: int = 5) -> dict[str, Any]:
+    return novel_search(query, limit=limit)
+
+
+# ── Conversation History RAG ───────────────────────────────────────
+
+@tool(
+    name="conversation_search",
+    description=(
+        "Search past conversation history (RAG). "
+        "Use this when you need to recall what was discussed earlier in the conversation, "
+        "what a character said before, or any details from previous dialogue turns "
+        "that are no longer in the current context window. "
+        "query: keywords or short description of the conversation you want to find. "
+        "Returns matching dialogue turns with user input and assistant response."
+    ),
+)
+def _tool_conversation_search(query: str, limit: int = 5) -> dict[str, Any]:
+    from llm.compact_manager import conversation_search as _conv_search
+    return _conv_search(query, limit=limit)
