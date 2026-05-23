@@ -182,9 +182,5 @@ class CompactManager:
         return "压缩失败，请参考原始对话历史。"
     
     def auto_compact_if_needed(self, messages: List[Dict[str, str]], token_usage: int = 0) -> List[Dict[str, str]]:
-        """自动检查并压缩消息（如果需要）"""
-        # logger.info("num tokens before compaction check: {}".format(self.num_tokens))
-        if self.needs_compaction(messages, token_usage):
-            logger.info("Token limit approaching, performing automatic compaction...")
-            return self.compact_messages(messages)
+        """自动检查并压缩消息（如果需要）—— 已禁用压缩功能"""
         return messages
