@@ -172,6 +172,9 @@ def main():
         },
     )
 
+    if config.config.characters:
+        llm_manager.character_name = config.config.characters[0].name
+
     if messages:
         llm_manager.set_messages(messages)
 

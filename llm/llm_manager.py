@@ -18,16 +18,21 @@ tool_manager = ToolManager()
 logger = logging.getLogger(__name__)
 
 
-def _auto_extract_memory_async(user_text: str, assistant_text: str) -> None:
+def _auto_extract_memory_async(user_text: str, assistant_text: str, character_name: str = "") -> None:
     """后台线程：自动从对话中提取关键事实存入 mem0。"""
     if not user_text.strip() or not assistant_text.strip():
         return
     try:
         from llm.tools.memory_tools import _get_mem0, _resolve_agent_id
         mem = _get_mem0()
+        agent_id = _resolve_agent_id(character_name or None)
         combined = f"User: {user_text}\nAssistant: {assistant_text}"
-        mem.add(combined, user_id="auto_extract", infer=True)
-        logger.info("自动记忆提取完成")
+        result = mem.add(combined, user_id=agent_id, infer=True)
+        extracted = result.get("results", []) if isinstance(result, dict) else []
+        if extracted:
+            logger.info("自动记忆提取完成: agent=%s, 提取 %d 条", agent_id, len(extracted))
+        else:
+            logger.debug("自动记忆提取: agent=%s, 本次无新事实", agent_id)
     except Exception as e:
         logger.warning("自动记忆提取失败: %s", e)
 
@@ -185,6 +190,7 @@ class LLMManager:
         self.llm_adapter = adapter
         self.messages = []
         self.user_template = user_template
+        self.character_name = ""
         self.compact_manager = CompactManager(adapter, max_tokens, compact_threshold)
         self.generation_config = generation_config or {}
         self.set_user_template(user_template)
@@ -245,7 +251,7 @@ class LLMManager:
         if last_user_msg.strip() and (content or "").strip():
             t = Thread(
                 target=_auto_extract_memory_async,
-                args=(last_user_msg, content or ""),
+                args=(last_user_msg, content or "", self.character_name),
                 daemon=True,
             )
             t.start()
