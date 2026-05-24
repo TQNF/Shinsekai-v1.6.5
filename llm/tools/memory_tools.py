@@ -275,7 +275,7 @@ def _get_rag_encoder() -> Any:
         return _rag_encoder
 
 
-def novel_search(query: str, limit: int = 5) -> dict[str, Any]:
+def novel_search(query: str, limit: int = 5, context_window: int = 20) -> dict[str, Any]:
     q = (query or "").strip()
     if not q:
         return {"error": "query 不能为空"}
@@ -289,13 +289,59 @@ def novel_search(query: str, limit: int = 5) -> dict[str, Any]:
             limit=limit,
         )
         hits = []
+        seen_indices = set()
         for r in results.points:
             payload = r.payload or {}
-            hits.append({
+            idx = payload.get("chunk_index", -1)
+            entry = {
                 "score": round(r.score, 4),
                 "chapter": payload.get("chapter", ""),
                 "text": payload.get("text", ""),
-            })
+                "chunk_index": idx,
+            }
+            hits.append(entry)
+            seen_indices.add(idx)
+
+        if context_window > 0 and hits:
+            neighbor_indices = set()
+            for idx in seen_indices:
+                if idx >= 0:
+                    for offset in range(1, context_window + 1):
+                        neighbor_indices.add(idx - offset)
+                        neighbor_indices.add(idx + offset)
+            neighbor_indices -= seen_indices
+            neighbor_indices.discard(-1)
+
+            if neighbor_indices:
+                from qdrant_client.models import FieldCondition, Filter, MatchAny
+                idx_values = [int(i) for i in neighbor_indices if i >= 0]
+                if idx_values:
+                    all_pts, _ = client.scroll(
+                        collection_name=_RAG_COLLECTION,
+                        scroll_filter=Filter(
+                            must=[
+                                FieldCondition(
+                                    key="chunk_index",
+                                    match=MatchAny(any=idx_values),
+                                )
+                            ]
+                        ),
+                        limit=len(idx_values) + 10,
+                    )
+                    for pt in all_pts:
+                        p = pt.payload or {}
+                        pi = p.get("chunk_index", -1)
+                        if pi in neighbor_indices:
+                            hits.append({
+                                "score": 0.0,
+                                "chapter": p.get("chapter", ""),
+                                "text": p.get("text", ""),
+                                "chunk_index": pi,
+                                "context": True,
+                            })
+
+            hits.sort(key=lambda h: h.get("chunk_index", 0))
+
         return {"query": q, "count": len(hits), "results": hits}
     except Exception as e:
         logger.exception("novel_search 失败")

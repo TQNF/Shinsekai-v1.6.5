@@ -18,7 +18,8 @@ import uuid
 from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-TEMPLATE_FILE = DATA_DIR / "character_templates" / "_temp_split.json"
+TEMPLATE_FILE = DATA_DIR / "character_templates" / "_novel_extract.txt"
+NOVEL_JSON_FILE = DATA_DIR / "character_templates" / "_temp_split.json"
 QDRANT_PATH = (DATA_DIR / "memory" / "qdrant_rag").as_posix()
 COLLECTION_NAME = "novel_rag"
 EMBEDDING_DIMS = 384
@@ -27,16 +28,19 @@ OVERLAP = 100
 
 
 def _load_novel_text() -> str:
-    if not TEMPLATE_FILE.exists():
-        print(f"错误: 找不到角色模板文件 {TEMPLATE_FILE}")
-        sys.exit(1)
-    with open(TEMPLATE_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    scenario = data.get("scenario", "")
-    if not scenario.strip():
-        print("错误: scenario 字段为空")
-        sys.exit(1)
-    return scenario
+    if TEMPLATE_FILE.exists():
+        with open(TEMPLATE_FILE, "r", encoding="utf-8") as f:
+            text = f.read()
+        if text.strip():
+            return text
+    if NOVEL_JSON_FILE.exists():
+        with open(NOVEL_JSON_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        scenario = data.get("scenario", "")
+        if scenario.strip():
+            return scenario
+    print(f"错误: 找不到小说原文文件 ({TEMPLATE_FILE} 或 {NOVEL_JSON_FILE})")
+    sys.exit(1)
 
 
 def _split_into_chunks(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = OVERLAP) -> list[dict]:

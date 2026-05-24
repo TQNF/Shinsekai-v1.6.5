@@ -3,6 +3,7 @@ import json
 import tiktoken
 import uuid
 import threading
+import time
 import logging
 from typing import List, Dict, Any
 from pathlib import Path
@@ -91,6 +92,16 @@ def _archive_messages_to_rag(messages: List[Dict[str, str]]) -> int:
 
         vectors = encoder.encode(texts_to_encode, show_progress_bar=False, batch_size=32)
 
+        max_idx = -1
+        try:
+            all_pts, _ = client.scroll(collection_name=_CONV_COLLECTION, limit=10000)
+            for pt in all_pts:
+                ci = (pt.payload or {}).get("chunk_index", -1)
+                if isinstance(ci, int) and ci > max_idx:
+                    max_idx = ci
+        except Exception:
+            pass
+
         points = []
         for idx, (pair, vector) in enumerate(zip(pairs, vectors)):
             points.append(PointStruct(
@@ -100,6 +111,7 @@ def _archive_messages_to_rag(messages: List[Dict[str, str]]) -> int:
                     "user": pair["user"],
                     "assistant": pair["assistant"],
                     "type": "conversation",
+                    "chunk_index": max_idx + 1 + idx,
                 },
             ))
 
@@ -112,7 +124,7 @@ def _archive_messages_to_rag(messages: List[Dict[str, str]]) -> int:
         return 0
 
 
-def conversation_search(query: str, limit: int = 5) -> Dict[str, Any]:
+def conversation_search(query: str, limit: int = 5, context_window: int = 20) -> Dict[str, Any]:
     q = (query or "").strip()
     if not q:
         return {"error": "query 不能为空"}
@@ -127,13 +139,59 @@ def conversation_search(query: str, limit: int = 5) -> Dict[str, Any]:
             limit=limit,
         )
         hits = []
+        seen_indices = set()
         for r in results.points:
             payload = r.payload or {}
-            hits.append({
+            idx = payload.get("chunk_index", -1)
+            entry = {
                 "score": round(r.score, 4),
                 "user": payload.get("user", ""),
                 "assistant": payload.get("assistant", ""),
-            })
+                "chunk_index": idx,
+            }
+            hits.append(entry)
+            seen_indices.add(idx)
+
+        if context_window > 0 and hits:
+            neighbor_indices = set()
+            for idx in seen_indices:
+                if idx >= 0:
+                    for offset in range(1, context_window + 1):
+                        neighbor_indices.add(idx - offset)
+                        neighbor_indices.add(idx + offset)
+            neighbor_indices -= seen_indices
+            neighbor_indices.discard(-1)
+
+            if neighbor_indices:
+                from qdrant_client.models import FieldCondition, Filter, MatchAny
+                idx_values = [int(i) for i in neighbor_indices if i >= 0]
+                if idx_values:
+                    all_pts, _ = client.scroll(
+                        collection_name=_CONV_COLLECTION,
+                        scroll_filter=Filter(
+                            must=[
+                                FieldCondition(
+                                    key="chunk_index",
+                                    match=MatchAny(any=idx_values),
+                                )
+                            ]
+                        ),
+                        limit=len(idx_values) + 10,
+                    )
+                    for pt in all_pts:
+                        p = pt.payload or {}
+                        pi = p.get("chunk_index", -1)
+                        if pi in neighbor_indices:
+                            hits.append({
+                                "score": 0.0,
+                                "user": p.get("user", ""),
+                                "assistant": p.get("assistant", ""),
+                                "chunk_index": pi,
+                                "context": True,
+                            })
+
+            hits.sort(key=lambda h: h.get("chunk_index", 0))
+
         return {"query": q, "count": len(hits), "results": hits}
     except Exception as e:
         logger.exception("conversation_search 失败")
@@ -141,48 +199,34 @@ def conversation_search(query: str, limit: int = 5) -> Dict[str, Any]:
 
 
 def _sanitize_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """清理消息列表，移除孤立的 tool 消息和不完整的 tool_calls 链"""
     if not messages:
         return messages
+
+    tool_call_map = {}
+    for m in messages:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                tool_call_map[tc.get("id", "")] = True
+
     cleaned = []
-    i = 0
-    while i < len(messages):
-        m = messages[i]
+    for m in messages:
         role = m.get("role", "")
         if role == "tool":
-            # 检查前面是否有匹配的 assistant(tool_calls)
             tc_id = m.get("tool_call_id", "")
-            has_parent = False
-            for j in range(len(cleaned) - 1, -1, -1):
-                prev = cleaned[j]
-                if prev.get("role") == "assistant" and prev.get("tool_calls"):
-                    tc_ids = [tc.get("id", "") for tc in prev["tool_calls"]]
-                    if tc_id in tc_ids:
-                        has_parent = True
-                        break
-                elif prev.get("role") in ("user", "system"):
-                    break
-            if not has_parent:
+            if tc_id not in tool_call_map:
                 logger.warning("移除孤立 tool 消息: tool_call_id=%s", tc_id)
-                i += 1
                 continue
         elif role == "assistant" and m.get("tool_calls"):
-            # 检查后面是否有对应的 tool 消息
             tc_ids = [tc.get("id", "") for tc in m["tool_calls"]]
             has_response = False
-            for j in range(i + 1, len(messages)):
-                nxt = messages[j]
-                if nxt.get("role") == "tool" and nxt.get("tool_call_id", "") in tc_ids:
+            for other in messages:
+                if other.get("role") == "tool" and other.get("tool_call_id", "") in tc_ids:
                     has_response = True
-                    break
-                elif nxt.get("role") in ("user", "system"):
                     break
             if not has_response:
                 logger.warning("移除无响应的 assistant(tool_calls) 消息")
-                i += 1
                 continue
         cleaned.append(m)
-        i += 1
     return cleaned
 
 
@@ -191,9 +235,10 @@ class CompactManager:
 
     def __init__(self, llm_adapter, max_tokens: int = 128000, compact_threshold: float = 0.9):
         self.llm_adapter = llm_adapter
-        self.max_tokens = max_tokens
+        self.max_tokens = max_tokens if max_tokens > 0 else 128000
         self.compact_threshold = compact_threshold
         self.num_tokens = 0
+        self._last_compact_time = 0.0
 
         try:
             self.encoder = tiktoken.get_encoding("cl100k_base")
@@ -233,6 +278,10 @@ class CompactManager:
             self.increase_token_count(messages[-1:], token_usage)
         token_count = self.num_tokens
         threshold_tokens = self.max_tokens * self.compact_threshold
+        non_system_count = sum(1 for m in messages if m.get("role") != "system")
+        if non_system_count <= 6:
+            logger.debug("Skip compact: only %d non-system messages", non_system_count)
+            return False
         return token_count > threshold_tokens
 
     def auto_compact_if_needed(self, messages: List[Dict[str, str]], token_usage: int = 0) -> List[Dict[str, str]]:
@@ -247,10 +296,15 @@ class CompactManager:
         if len(messages) <= 3:
             return messages
 
+        now = time.monotonic()
+        if now - self._last_compact_time < 5.0:
+            logger.debug("Compact cooldown: skipping (last compact %.1fs ago)", now - self._last_compact_time)
+            return messages
+
         system_message = messages[0] if messages[0].get('role') == 'system' else None
         non_system = messages[1:] if system_message else messages
 
-        keep_recent = 10
+        keep_recent = 20
         if len(non_system) <= keep_recent:
             return messages
 
@@ -317,4 +371,5 @@ class CompactManager:
         result.extend(messages_to_keep)
         result = _sanitize_messages(result)
         self.num_tokens = self.count_tokens(result)
+        self._last_compact_time = time.monotonic()
         return result

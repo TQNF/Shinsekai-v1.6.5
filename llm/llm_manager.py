@@ -226,12 +226,13 @@ class LLMManager:
         self.messages.append(msg)
         
         # --- Auto-Compact 逻辑 ---
-        # 自动调用 compact_manager 检查 token 是否超限并执行压缩
-        compacted_messages = self.compact_manager.auto_compact_if_needed(self.messages)
-        compacted_messages = _sanitize_messages(compacted_messages)
-        if len(compacted_messages) < len(self.messages):
-            self.logger.info(f"Auto-compact triggered: Reduced messages from {len(self.messages)} to {len(compacted_messages)}")
-            self.messages = compacted_messages
+        # 只在 user 消息时触发 compact，避免工具调用链中被误删
+        if role == "user":
+            compacted_messages = self.compact_manager.auto_compact_if_needed(self.messages)
+            compacted_messages = _sanitize_messages(compacted_messages)
+            if len(compacted_messages) < len(self.messages):
+                self.logger.info(f"Auto-compact triggered: Reduced messages from {len(self.messages)} to {len(compacted_messages)}")
+                self.messages = compacted_messages
 
     def clear_messages(self):
         self.messages = [{"role": "system", "content": self.user_template}]
